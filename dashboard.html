@@ -212,9 +212,13 @@ body {
 /* ========== STATS ROW ========== */
 .stats-row {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: var(--sp-3);
-  margin-bottom: var(--sp-4);
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+
+@media (min-width: 400px) {
+  .stats-row { gap: var(--sp-3); margin-bottom: var(--sp-4); }
 }
 
 .stat-card {
@@ -223,17 +227,26 @@ body {
   -webkit-backdrop-filter: blur(16px);
   border: 1px solid var(--border-glass);
   border-radius: var(--radius-md);
-  padding: var(--sp-4) var(--sp-3);
+  padding: var(--sp-3) var(--sp-2);
   text-align: center;
   box-shadow: var(--shadow-card);
+  min-width: 0;
+}
+
+@media (min-width: 400px) {
+  .stat-card { padding: var(--sp-4) var(--sp-3); }
 }
 
 .stat-value {
-  font-size: var(--text-xl);
+  font-size: var(--text-lg);
   font-weight: 800;
   color: var(--accent-text);
   font-variant-numeric: tabular-nums;
   line-height: 1.2;
+}
+
+@media (min-width: 400px) {
+  .stat-value { font-size: var(--text-xl); }
 }
 
 .stat-label {
@@ -1148,9 +1161,7 @@ body {
     margin-bottom: 0;
   }
 
-  .stats-row {
-    grid-template-columns: repeat(4, 1fr);
-  }
+  /* stats-row already 4 columns */
 }
 
 /* ========== ANIMATIONS ========== */
@@ -1252,6 +1263,11 @@ body {
         <div class="stat-value" id="stat-lost">0.0</div>
         <div class="stat-label">Lost</div>
         <div class="stat-sub">kg</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="stat-weekly">-</div>
+        <div class="stat-label">Weekly</div>
+        <div class="stat-sub" id="stat-weekly-sub">kg/week</div>
       </div>
       <div class="stat-card">
         <div class="stat-value" id="stat-target">87</div>
@@ -1806,6 +1822,64 @@ document.getElementById('stat-weight').textContent = latestWeight.toFixed(1);
 document.getElementById('stat-lost').textContent = lost.toFixed(1);
 document.getElementById('progress-pct').textContent = progressPct + '%';
 document.getElementById('progress-fill').style.width = progressPct + '%';
+updateWeeklyRate();
+
+// ========== WEEKLY RATE ==========
+function updateWeeklyRate() {
+  const el = document.getElementById('stat-weekly');
+  const sub = document.getElementById('stat-weekly-sub');
+  const logs = state.weightLog || [];
+  if (logs.length < 2) {
+    el.textContent = '1.0';
+    sub.textContent = 'target';
+    el.style.color = 'var(--accent-text)';
+    return;
+  }
+  // Find last 7-14 days of data to calculate rate
+  const now = new Date();
+  const recent = logs.filter(l => {
+    const d = new Date(l.d);
+    const daysAgo = (now - d) / (1000 * 60 * 60 * 24);
+    return daysAgo <= 14;
+  });
+  if (recent.length < 2) {
+    // Use first and last log
+    const first = logs[0];
+    const last = logs[logs.length - 1];
+    const days = Math.max(1, (new Date(last.d) - new Date(first.d)) / (1000 * 60 * 60 * 24));
+    const weeklyRate = ((first.w - last.w) / days) * 7;
+    setWeeklyDisplay(el, sub, weeklyRate);
+    return;
+  }
+  // Linear rate over recent period
+  const first = recent[0];
+  const last = recent[recent.length - 1];
+  const days = Math.max(1, (new Date(last.d) - new Date(first.d)) / (1000 * 60 * 60 * 24));
+  const weeklyRate = ((first.w - last.w) / days) * 7;
+  setWeeklyDisplay(el, sub, weeklyRate);
+}
+
+function setWeeklyDisplay(el, sub, rate) {
+  const absRate = Math.abs(rate);
+  el.textContent = absRate.toFixed(1);
+  if (rate <= 0) {
+    // Gaining or flat
+    el.style.color = 'var(--danger)';
+    sub.textContent = rate < 0 ? 'gaining!' : 'stalled';
+  } else if (absRate > 1.2) {
+    // Too fast
+    el.style.color = 'var(--warning)';
+    sub.textContent = 'too fast!';
+  } else if (absRate >= 0.7 && absRate <= 1.2) {
+    // Perfect range
+    el.style.color = 'var(--success)';
+    sub.textContent = 'kg/week';
+  } else {
+    // Slow but ok
+    el.style.color = 'var(--accent-text)';
+    sub.textContent = 'kg/week';
+  }
+}
 
 // ========== WEEK GRID ==========
 function renderWeek() {
@@ -2179,6 +2253,10 @@ document.getElementById('log-weight-btn').addEventListener('click', () => {
   document.getElementById('progress-fill').style.width = pct + '%';
 
   renderWeightChart();
+  updateWeeklyRate();
+  // Hide Monday reminder if it was showing
+  const reminder = document.getElementById('weighin-reminder');
+  if (reminder) reminder.style.display = 'none';
   toast('Weight logged: ' + val.toFixed(1) + ' kg');
 });
 
@@ -2423,6 +2501,7 @@ function reRenderAll() {
   document.getElementById('stat-lost').textContent = ls.toFixed(1);
   document.getElementById('progress-pct').textContent = pp + '%';
   document.getElementById('progress-fill').style.width = pp + '%';
+  updateWeeklyRate();
   renderWeek();
   renderWorkout();
   renderRecovery();
