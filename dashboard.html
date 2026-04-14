@@ -1341,6 +1341,14 @@ body {
       </div>
     </div>
 
+    <div class="card" id="sync-status-card">
+      <div class="card-title" style="margin-bottom:var(--sp-4)">Cloud Sync</div>
+      <div style="display:flex;flex-direction:column;gap:var(--sp-3)">
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--text-secondary)">Status</span><span id="sync-status" style="color:var(--success)">Connected</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--text-secondary)">Row ID</span><span id="sync-row-id" style="color:var(--text-muted);font-size:var(--text-xs);max-width:180px;overflow:hidden;text-overflow:ellipsis">-</span></div>
+      </div>
+      <button class="reset-btn" id="logout-btn" style="background:var(--warning-dim);color:var(--warning);border-color:rgba(245,158,11,0.2);margin-top:var(--sp-4)">Logout (switch device)</button>
+    </div>
     <button class="reset-btn" id="reset-btn">Reset All Data</button>
   </section>
 </div>
@@ -1483,12 +1491,46 @@ const PROGRAM = {
   ]
 };
 
+// ========== SUPABASE CONFIG ==========
+const SUPABASE_URL = 'https://xixxloxqmlocvdslosxp.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhpeHhsb3hxbWxvY3Zkc2xvc3hwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYxNjc4MTQsImV4cCI6MjA5MTc0MzgxNH0.oRsz7OjuVBcKO41MlDxSxM_IWTYNT_nmCLZ6P7vZ88A';
+
+async function supaFetch(method, params, body) {
+  const url = `${SUPABASE_URL}/rest/v1/fitness_tracker${params || ''}`;
+  const opts = {
+    method,
+    headers: {
+      'apikey': SUPABASE_ANON_KEY,
+      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json',
+      'Prefer': method === 'POST' ? 'return=representation' : method === 'PATCH' ? 'return=representation' : undefined
+    }
+  };
+  if (opts.headers.Prefer === undefined) delete opts.headers.Prefer;
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(url, opts);
+  if (!res.ok) { const err = await res.text(); throw new Error(err); }
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+// Simple password hash (SHA-256)
+async function hashPassword(pw) {
+  const data = new TextEncoder().encode(pw);
+  const buf = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 // ========== STATE ==========
 const LS_KEY = 'hybrid-coach-v1';
+const LS_ROW_ID = 'hybrid-coach-row-id';
 const dateStr = d => d.toISOString().split('T')[0];
 const today = new Date();
 const todayKey = dateStr(today);
 const dayIndex = (today.getDay() + 6) % 7; // Mon=0
+
+let _syncTimer = null;
+let _rowId = localStorage.getItem(LS_ROW_ID) || null;
 
 function loadState() {
   try {
@@ -1497,7 +1539,97 @@ function loadState() {
 }
 
 function saveState(s) {
+  // Stamp sync time
+  s._lastSync = Date.now();
+  // Save locally immediately
   localStorage.setItem(LS_KEY, JSON.stringify(s));
+  // Debounced cloud sync (500ms)
+  if (_syncTimer) clearTimeout(_syncTimer);
+  _syncTimer = setTimeout(() => syncToCloud(s), 500);
+}
+
+async function syncToCloud(s) {
+  if (!_rowId) return;
+  try {
+    await supaFetch('PATCH', `?id=eq.${_rowId}`, { data: s, updated_at: new Date().toISOString() });
+  } catch (e) {
+    console.warn('Cloud sync failed:', e.message);
+  }
+}
+
+async function loadFromCloud() {
+  if (!_rowId) return null;
+  try {
+    const rows = await supaFetch('GET', `?id=eq.${_rowId}&select=data`);
+    if (rows && rows.length > 0) return rows[0].data;
+  } catch (e) {
+    console.warn('Cloud load failed:', e.message);
+  }
+  return null;
+}
+
+// ========== AUTH ==========
+async function handleAuth() {
+  const stored = localStorage.getItem(LS_ROW_ID);
+  if (stored) {
+    _rowId = stored;
+    // Load cloud data and merge
+    const cloudData = await loadFromCloud();
+    if (cloudData) {
+      const localData = loadState();
+      // Use whichever has more recent data
+      const cloudTime = cloudData._lastSync || 0;
+      const localTime = localData._lastSync || 0;
+      if (cloudTime >= localTime) {
+        localStorage.setItem(LS_KEY, JSON.stringify(cloudData));
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+async function login(password) {
+  const hash = await hashPassword(password);
+  try {
+    const rows = await supaFetch('GET', `?password_hash=eq.${hash}&select=id,data`);
+    if (rows && rows.length > 0) {
+      _rowId = rows[0].id;
+      localStorage.setItem(LS_ROW_ID, _rowId);
+      if (rows[0].data && Object.keys(rows[0].data).length > 0) {
+        localStorage.setItem(LS_KEY, JSON.stringify(rows[0].data));
+      }
+      return true;
+    }
+    return false;
+  } catch (e) {
+    console.error('Login failed:', e);
+    return false;
+  }
+}
+
+async function register(password) {
+  const hash = await hashPassword(password);
+  try {
+    const existing = await supaFetch('GET', `?password_hash=eq.${hash}&select=id`);
+    if (existing && existing.length > 0) {
+      // Already exists, just login
+      _rowId = existing[0].id;
+      localStorage.setItem(LS_ROW_ID, _rowId);
+      return true;
+    }
+    const localData = loadState();
+    const rows = await supaFetch('POST', '', { password_hash: hash, data: localData });
+    if (rows && rows.length > 0) {
+      _rowId = rows[0].id;
+      localStorage.setItem(LS_ROW_ID, _rowId);
+      return true;
+    }
+    return false;
+  } catch (e) {
+    console.error('Register failed:', e);
+    return false;
+  }
 }
 
 function getToday(state) {
@@ -2017,9 +2149,26 @@ document.querySelectorAll('.nav-item').forEach(btn => {
 document.getElementById('reset-btn').addEventListener('click', () => {
   if (confirm('Reset ALL data? This cannot be undone.')) {
     localStorage.removeItem(LS_KEY);
+    localStorage.removeItem(LS_ROW_ID);
     location.reload();
   }
 });
+
+document.getElementById('logout-btn').addEventListener('click', () => {
+  localStorage.removeItem(LS_ROW_ID);
+  _rowId = null;
+  location.reload();
+});
+
+// Update sync status display
+if (_rowId) {
+  document.getElementById('sync-row-id').textContent = _rowId.substring(0, 8) + '...';
+  document.getElementById('sync-status').textContent = 'Connected';
+  document.getElementById('sync-status').style.color = 'var(--success)';
+} else {
+  document.getElementById('sync-status').textContent = 'Not connected';
+  document.getElementById('sync-status').style.color = 'var(--danger)';
+}
 
 // ========== INITIAL CHART ==========
 // Defer to avoid blocking
@@ -2027,6 +2176,143 @@ setTimeout(() => {
   renderWeightChart();
   renderLifts();
 }, 100);
+
+// ========== CLOUD SYNC INIT ==========
+// On page load, check if already authenticated
+(async function initSync() {
+  const authed = await handleAuth();
+  if (!authed) {
+    showLoginScreen();
+  } else {
+    // Refresh state from cloud
+    const cloudData = await loadFromCloud();
+    if (cloudData && Object.keys(cloudData).length > 0) {
+      const local = loadState();
+      const cloudTime = cloudData._lastSync || 0;
+      const localTime = local._lastSync || 0;
+      if (cloudTime > localTime) {
+        state = cloudData;
+        localStorage.setItem(LS_KEY, JSON.stringify(state));
+        // Re-render everything with cloud data
+        reRenderAll();
+      }
+    }
+    toast('Synced with cloud');
+  }
+})();
+
+function showLoginScreen() {
+  const overlay = document.createElement('div');
+  overlay.id = 'login-overlay';
+  overlay.style.cssText = `
+    position:fixed;inset:0;z-index:1000;background:var(--bg-base);
+    display:flex;align-items:center;justify-content:center;
+    padding:var(--sp-4);
+  `;
+  overlay.innerHTML = `
+    <div style="width:100%;max-width:360px;text-align:center;">
+      <div style="font-size:var(--text-3xl);font-weight:800;margin-bottom:var(--sp-2);
+        background:linear-gradient(135deg,var(--text-primary),var(--accent-text));
+        -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">
+        Hybrid Coach
+      </div>
+      <div style="color:var(--text-secondary);margin-bottom:var(--sp-8);font-size:var(--text-sm);">
+        Enter your password to sync across devices
+      </div>
+      <input type="password" id="auth-pw" placeholder="Password"
+        style="width:100%;background:var(--bg-elevated);border:1px solid var(--border-glass);
+        border-radius:var(--radius-md);padding:var(--sp-4);color:var(--text-primary);
+        font-family:var(--font);font-size:var(--text-base);outline:none;min-height:48px;
+        margin-bottom:var(--sp-3);text-align:center;" />
+      <div style="display:flex;gap:var(--sp-3);">
+        <button id="auth-login-btn" style="flex:1;background:var(--accent);color:var(--text-inverse);
+          border:none;border-radius:var(--radius-md);padding:var(--sp-4);font-family:var(--font);
+          font-size:var(--text-base);font-weight:700;cursor:pointer;min-height:48px;">
+          Login
+        </button>
+        <button id="auth-register-btn" style="flex:1;background:var(--bg-elevated);color:var(--accent-text);
+          border:1px solid var(--border-glass);border-radius:var(--radius-md);padding:var(--sp-4);
+          font-family:var(--font);font-size:var(--text-base);font-weight:600;cursor:pointer;min-height:48px;">
+          New Device
+        </button>
+      </div>
+      <div id="auth-error" style="color:var(--danger);font-size:var(--text-sm);margin-top:var(--sp-3);display:none;"></div>
+      <div style="color:var(--text-muted);font-size:var(--text-xs);margin-top:var(--sp-6);line-height:1.6;">
+        First time? Pick a password and tap <strong style="color:var(--text-secondary)">New Device</strong>.<br>
+        Already set up? Enter your password and tap <strong style="color:var(--text-secondary)">Login</strong>.
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  const pwInput = document.getElementById('auth-pw');
+  const errDiv = document.getElementById('auth-error');
+
+  pwInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') document.getElementById('auth-login-btn').click();
+  });
+
+  document.getElementById('auth-login-btn').addEventListener('click', async () => {
+    const pw = pwInput.value.trim();
+    if (!pw || pw.length < 4) { errDiv.textContent = 'Password must be at least 4 characters'; errDiv.style.display = 'block'; return; }
+    errDiv.style.display = 'none';
+    const ok = await login(pw);
+    if (ok) {
+      overlay.remove();
+      state = loadState();
+      reRenderAll();
+      toast('Logged in - data synced');
+    } else {
+      errDiv.textContent = 'Wrong password or no account found. Tap "New Device" to create one.';
+      errDiv.style.display = 'block';
+    }
+  });
+
+  document.getElementById('auth-register-btn').addEventListener('click', async () => {
+    const pw = pwInput.value.trim();
+    if (!pw || pw.length < 4) { errDiv.textContent = 'Password must be at least 4 characters'; errDiv.style.display = 'block'; return; }
+    errDiv.style.display = 'none';
+    const ok = await register(pw);
+    if (ok) {
+      overlay.remove();
+      state = loadState();
+      // Mark sync time and push local data to cloud
+      state._lastSync = Date.now();
+      saveState(state);
+      reRenderAll();
+      toast('Account created - data syncing');
+    } else {
+      errDiv.textContent = 'Something went wrong. Try again.';
+      errDiv.style.display = 'block';
+    }
+  });
+
+  pwInput.focus();
+}
+
+function reRenderAll() {
+  // Update stats
+  const lw = state.weightLog && state.weightLog.length > 0 ? state.weightLog[state.weightLog.length - 1].w : PROGRAM.startWeight;
+  const ls = Math.max(0, PROGRAM.startWeight - lw);
+  const tl = PROGRAM.startWeight - PROGRAM.targetWeight;
+  const pp = Math.min(100, Math.round((ls / tl) * 100));
+  document.getElementById('stat-weight').textContent = lw.toFixed(1);
+  document.getElementById('stat-lost').textContent = ls.toFixed(1);
+  document.getElementById('progress-pct').textContent = pp + '%';
+  document.getElementById('progress-fill').style.width = pp + '%';
+  renderWeek();
+  renderWorkout();
+  renderRecovery();
+  renderMeals();
+  renderSupps();
+  renderHydration();
+  renderWeightChart();
+  renderLifts();
+}
+
+// Add timestamp on every save for sync ordering
+const _origSaveState = saveState;
+// Override saveState to add sync timestamp (already defined above, just ensure _lastSync is set)
 </script>
 </body>
 </html>
